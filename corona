@@ -1,0 +1,819 @@
+#!/usr/bin/env bash
+
+export POSIXLY_CORRECT=yes
+export LC_ALL=C
+print_help(){
+    echo "Usage: corona [-h] [FILTERS] [COMMAND] [LOG [LOG2 [...]]"
+    echo ""
+    echo "COMMAND one of:"
+    echo ""
+    echo "  infected            counts number of infected people."
+    echo "  merge               merges several log files into one, preserving the original order."
+    echo "  gender              lists statistics on infected people for each gender."
+    echo "  age                 lists statistics on infected people grouped by age, chronologically."
+    echo "  daily               lists statistics on infected people grouped by day, chronologically."
+    echo "  monthly             lists statistics on infected people grouped by month, chronologically."
+    echo "  yearly              lists statistics on infected people grouped by year, chronologically."
+    echo "  districts           lists statistics on infected people grouped by district, alphabeticaly."
+    echo "  regions             lists statistics on infected people grouped by region, alphabeticaly."
+    echo "  countries           lists statistics on infected people grouped by country of infection(without CZ)."
+    echo ""
+    echo "FILTERS max 1 of each:"
+    echo ""
+    echo "  -a DATETIME         after: only records AFTER this date are considered (including this date)."
+    echo "  -b DATETIME         before: only records BEFORE this date are considered (including this date). "
+    echo "  -g GENDER           only records of infected people of a given sex are considered."
+    echo "  -s [WIDTH]          for the commands gender, age, daily, monthly, yearly, countries, districts and regions,"
+    echo "                      it displays the data not numerically, but graphically in the form of histograms." 
+    echo "                      The optional parameter WIDTH sets the width of the histograms, ie the length of the longest line."
+    echo ""
+    echo "-h                    prints help with a short description of each command and switch."
+    echo ""
+    echo "Script can work with multiple source files if no files are given then scrip reads from stdin."
+    echo "Script is able to handle .bz2 and .gz files."
+    echo ""
+}
+#setting variables
+#implitic command merge
+COMMAND="merge"
+#maximal and minimal value so every date is ok
+DATE_BEFORE="9999-99-99"
+DATE_AFTER=""
+GENDER=""
+IS_COMMAND="false"
+LOG_FILES=""
+GZ_LOG_FILES=""
+BZ_LOG_FILES=""
+HEADER="id,datum,vek,pohlavi,kraj_nuts_kod,okres_lau_kod,nakaza_v_zahranici,nakaza_zeme_csu_kod,reportovano_khs"
+INPUT=""
+IS_G="false"
+IS_A="false"
+IS_B="false"
+IS_S="false"
+#arguments can be given in any order
+#looping through args and checking validity
+while [ "$#" -gt 0 ]; do
+    #cases with possible arguments
+    case "$1" in
+    infected|merge|gender|age|daily|monthly|yearly|districts|regions|countries)
+        if [ $IS_COMMAND = "false" ]; then
+            IS_COMMAND="true"
+            COMMAND="$1"
+            shift
+        else 
+            echo "Error: Multiple commands" >&2
+            exit 1
+        fi
+        ;;
+    -a)
+        if  [ $IS_A = "false" ]; then
+            if [ -n "$2" ]; then
+                if [[ "$2" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && date -d "$2" >/dev/null; then
+                    DATE_AFTER="$2"
+                    IS_A="true"
+                    shift
+                    shift
+                else
+                    echo "Error: Invalid date in -d filter check format" >&2
+                    exit 1
+                fi
+            else
+                echo "Error: Argument for -a is missing" >&2
+                exit 1
+            fi
+        else
+            echo "Error: duplicit filter args" >&2
+            exit 1
+        fi
+        ;;
+    -b)
+        if  [ $IS_B = "false" ]; then
+            if [ -n "$2" ]; then
+                if [[ "$2" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && date -d "$2" >/dev/null; then
+                    DATE_BEFORE="$2"
+                    IS_B="true"
+                    shift
+                    shift
+                else
+                    echo "Error: Invalid date in -b filter check format" >&2
+                    exit 1
+                fi
+            else
+                echo "Error: Argument for -b is missing" >&2
+                exit 1
+            fi
+        else
+            echo "Error: duplicit filter args" >&2
+            exit 1
+        fi
+        ;;
+    -g)
+        if [ $IS_G = "false" ]; then
+            if [ -n "$2" ]; then
+                if [ "$2" = "M" ] || [ "$2" = "Z" ]; then
+                    IS_G="true"
+                    GENDER="$2"
+                    shift
+                    shift
+                else
+                    echo "Error: -g argument has to be 'M' or 'Z'" >&2
+                    exit 1
+                fi 
+            else
+                echo "Error: Argument for -g is missing" >&2
+                exit 1
+            fi
+        else
+            echo "Error: duplicit filter args" >&2
+            exit 1
+        fi
+        ;;
+    -s)
+        if [ $IS_S = "false" ]; then
+            if [[ "$2" =~ ^[0-9]*$ ]] && [ -n "$2" ]; then
+                WIDTH="$2"
+                IS_S="true"
+                shift
+                shift
+            elif [ -z "$2" ];then
+                WIDTH="-1"
+                IS_S="true"
+                shift
+            else 
+                case "$2" in
+                infected|merge|gender|age|daily|monthly|yearly|districts|regions|countries|-g|-b|-a|*.csv*)
+                    WIDTH="-1"
+                    IS_S="true"
+                    shift
+                    ;;
+                *)
+                    echo "Error: Wrong -s filter" >&2
+                    exit 1
+                    ;;
+                esac
+            fi
+        else
+            echo "Error: duplicit filter args" >&2
+            exit 1
+        fi
+        ;;
+    -h)
+        print_help
+        exit 0
+        ;;
+    #storing files into 1 variable
+    *.gz)
+        if [ ! -e "$1" ];then
+            echo "Error: file $1 does not exist" >&2
+            exit 1
+        fi
+        GZ_LOG_FILES="$GZ_LOG_FILES $1"
+        shift
+        ;;
+    *.bz2)
+        if [ ! -e "$1" ];then
+            echo "Error: file $1 does not exist" >&2
+            exit 1
+        fi
+        BZ_LOG_FILES="$BZ_LOG_FILES $1"
+        shift
+        ;;
+    *.csv)
+        if [ ! -e "$1" ];then
+            echo "Error: file $1 does not exist" >&2
+            exit 1
+        fi
+        LOG_FILES="$LOG_FILES $1 "
+        shift
+        ;;
+    *)
+        echo "Error: Wrong argument use '-h' for help" >&2
+        exit 1
+    esac
+done
+
+#function that clears whitelines and white chars deleting headers and
+#validates dates with with looong regex small one for age validation
+function datevalid(){
+    grep -v "$1"|sed '/^[[:space:]]*$/d'|sed 's/ //g' | awk -F, '
+    {
+        if($2!="" && $2 !~ /(^[0-9]{4}-(((01|03|05|07|08|10|12)-(0[1-9]|[1-2][0-9]|3[0-1]))|((04|06|09|11)-(0[1-9]|[1-2][0-9]|30))|((02)-(0[1-9]|[1-2][0-8]|19)))$)|(^[0-9]{2}(([02468])([048]))|(([13579])([26])))-02-29$/){
+            print "Invalid date: " $0 > "/dev/stderr"
+        }
+        else if($3 !~ /^[0-9]*$/ && $3!=""){
+            print "Invalid age: " $0 > "/dev/stderr"
+            }
+        else{
+            print $0
+        }
+    }'
+}
+#age validation function
+function datefilter(){
+    awk -F, -vBEFORE="$1" -vAFTER="$2" '
+    {
+        if(BEFORE=="9999-99-99" || $2!=""){
+            if($2 <= BEFORE && $2 >= AFTER){
+                print $0
+            }
+        }
+    }'
+}
+#gendervalidation function
+function gendervalid(){
+    awk -F, -v G="$1" '{if($4 == G || G==""){print $0}}'
+}
+#every command in 1 function
+function commandfunc(){
+    #1 stands for COMMAND argument given into function 
+    if [ $1 = "infected" ]; then
+        wc -l
+    fi
+
+    if [ $1 = "merge" ]; then
+        awk -v HEAD="$HEADER" 'BEGIN{print HEAD}{print}'
+    fi
+    #$2 stands for WIDTH argument if WITHD is not givern numbers are printed 
+    if [ -z "$2" ];then
+        #incrementing value in array each time tehre is M or Z or None index
+        #then printing each value 
+        if [ $1 = "gender" ]; then
+            awk -F, '
+            BEGIN{
+                a["Z"]=0; 
+                a["M"]=0;
+                a["None"]=0;
+            }
+            {
+                if($4==""){
+                    a["None"]++;
+                    next
+                }
+                a[$4]++
+            }
+            END{
+                print "M",a["M"]
+                print "Z",a["Z"]
+                if (a["None"] != 0 && $0!=""){
+                    print "None",a["None"]
+                }
+            }' OFS=": " 
+        fi
+        
+        if [ $1 = "daily" ]; then
+            awk -F, '
+            {
+                if($0!=""){
+                    if($2==""){
+                        a["None"]++;
+                        next
+                    }
+                    a[$2]++
+                }
+            }
+            END{
+                for (i in a){
+                    print i,a[i]
+                }
+            }' OFS=": "| sort | sed '/None:*[0-9]/d;1i\'
+        fi
+        #splitting date column into 3 parts and storing only years and moths
+        if [ $1 = "monthly" ]; then
+            awk -F, '
+            {   
+                if($0!=""){
+                    if($2==""){
+                        a["None"]++;
+                        next
+                    } 
+                    split($2,c,"-");
+                    a[c[1]"-"c[2]]++
+                }
+            }
+            END{
+                for (i in a){
+                    print i,a[i]
+                }
+            }' OFS=": "| sort | sed '/None:*[0-9]/d;1i\'
+        fi
+        #splitting date column into 3 parts and storing only years
+        if [ $1 = "yearly" ]; then
+            awk -F, '
+            {
+                if($0!=""){
+                    if($2==""){
+                        a["None"]++;
+                        next
+                    }
+                    split($2,c,"-");
+                    a[c[1]]++
+                }
+            }
+            END{
+                for (i in a){
+                    print i,a[i]
+                }
+            }' OFS=": " | sort | sed '/None:*[0-9]/d;1i\'
+        fi
+
+        if [ $1 = "districts" ]; then
+            awk -F, '
+            {   
+                if($0!=""){
+                    if($6==""){
+                        a["None"]++;
+                        next
+                    } 
+                    a[$6]++
+                }
+            }
+            END{
+                for (i in a){
+                    print i,a[i]
+                }
+            }' OFS=": "| sort
+        fi
+
+        if [ $1 = "regions" ]; then
+            awk -F, '
+            {
+                if($0!=""){
+                    if($5==""){
+                        a["None"]++;
+                        next
+                    } 
+                    a[$5]++
+                }
+            }
+            END{
+                for (i in a){
+                    print i,a[i]
+                }
+            }' OFS=": "| sort
+        fi
+
+        if [ $1 = "countries" ]; then
+            awk -F, '
+            {
+                if($0!=""){
+                    if($8=="" || $8=="CZ"){
+                        next
+                    }
+                    a[$8]++
+                }
+            }
+            END{
+                for (i in a){ 
+                    print i,a[i] 
+                }
+            }' OFS=": "| sort
+        fi
+        #age command not that pretty because of given structure
+        if [ $1 = "age" ]; then
+            awk -F, '
+            BEGIN{
+                a[1]=0;
+                a[2]=0;
+                a[3]=0;
+                a[4]=0;
+                a[5]=0;
+                a[6]=0;
+                a[7]=0;
+                a[8]=0;
+                a[9]=0;
+                a[10]=0;
+                a[11]=0;
+                a[12]=0;
+            }
+            {
+                if($3==""){a[13]++}
+                else if($3<=5){a[1]++}
+                else if($3>=6 && $3<=15){a[2]++} 
+                else if($3>=16 && $3<=25){a[3]++}
+                else if($3>=26 && $3<=35){a[4]++}
+                else if($3>=36 && $3<=45){a[5]++}
+                else if($3>=46 && $3<=55){a[6]++} 
+                else if($3>=56 && $3<=65){a[7]++}
+                else if($3>=66 && $3<=75){a[8]++}
+                else if($3>=76 && $3<=85){a[9]++}
+                else if($3>=86 && $3<=95){a[10]++}
+                else if($3>=96 && $3<=105){a[11]++}
+                else if($3>=105){a[12]++}
+            }
+            END{
+                for (i = 1; i <= 13; ++i){
+                    if(a[i]==""){
+                        a[i]=0
+                    }
+                }
+                print "0-5   : "a[1];
+                print "6-15  : "a[2]; 
+                print "16-25 : "a[3]; 
+                print "26-35 : "a[4]; 
+                print "36-45 : "a[5];
+                print "46-55 : "a[6]; 
+                print "56-65 : "a[7]; 
+                print "66-75 : "a[8]; 
+                print "76-85 : "a[9];
+                print "86-95 : "a[10]; 
+                print "96-105: "a[11];
+                print ">105  : "a[12]; 
+                if(a[13]!=0 && $0!="")
+                    {print "None  : "a[13]
+                }
+            }'
+        fi
+    #if any valid width is given command fucntions with histograms are executed
+    else
+        if [ $1 = "gender" ]; then
+            awk -F, -vWIDTH="$2" '
+            BEGIN{
+                a["Z"]=""; 
+                a["M"]="";
+                a["None"]="";
+                MAX=0
+            }
+            {
+                if($4==""){
+                    a["None"]++;
+                    next
+                }
+                a[$4]++
+            }
+            END{
+                for (j in a){
+                    if(a[j]>MAX){
+                        MAX=a[j]
+                    }
+                }
+                for (i in a){
+                    if(WIDTH == -1){
+                        NUMBER=a[i]/100000;
+                        NUMBER=int(NUMBER)
+                    }
+                    else{
+                        NUMBER=WIDTH*a[i]/MAX;
+                        NUMBER=int(NUMBER)
+                    }
+                    if(i=="None"){
+                        NONE_NUM=NUMBER;
+                        continue;
+                    }
+                    if(NUMBER==0){
+                        print i":";
+                    }
+                    else{
+                        HASH=sprintf("%"NUMBER"s"," ");
+                        gsub(" ","#",HASH);
+                        print i,HASH
+                    }
+                }
+                if (a["None"]!="" && $0!=""){
+                    if(NONE_NUM!=0){
+                        HASH=sprintf("%"NONE_NUM"s"," ");
+                        gsub(" ","#",HASH);
+                        print "None",HASH
+                    }
+                    else {
+                        print "None:";
+                    }
+                }
+            }' OFS=": "
+        fi
+
+        if [ $1 = "daily" ]; then
+            awk -F, -vWIDTH="$2" '
+            BEGIN{
+                MAX=0
+            }
+            {
+                if($0!=""){
+                    if($2==""){
+                        a["None"]++;
+                        next
+                    }
+                    a[$2]++
+                }
+            }
+            END{
+                for (j in a){
+                    if(a[j]>MAX){
+                        MAX=a[j]
+                    }
+                }
+                for (i in a){
+                    if(WIDTH == -1){
+                        NUMBER=a[i]/500;
+                        NUMBER=int(NUMBER)
+                    }
+                    else{
+                        NUMBER=WIDTH*a[i]/MAX;
+                        NUMBER=int(NUMBER)
+                    }
+                    if(NUMBER==0){
+                        print i":";
+                        continue
+                    }
+                    HASH=sprintf("%"NUMBER"s"," "); 
+                    gsub(" ","#",HASH);
+                    print i,HASH
+                }
+            }' OFS=": "| sort | sed '/None:*[0-9]/d;1i\'
+        fi
+
+        if [ $1 = "monthly" ]; then
+            awk -F, -vWIDTH="$2" '
+            BEGIN{
+                MAX=0
+            }
+            {
+                if($0!=""){
+                    if($2==""){
+                        a["None"]++;
+                        next
+                    }
+                    split($2,c,"-");
+                    a[c[1]"-"c[2]]++
+                }
+            }
+            END{
+                for (j in a){
+                    if(a[j]>MAX){
+                        MAX=a[j]
+                    }
+                }
+                for (i in a){
+                    if(WIDTH == -1){
+                        NUMBER=a[i]/10000;
+                        NUMBER=int(NUMBER);
+                    }
+                    else{
+                        NUMBER=WIDTH*a[i]/MAX;
+                        NUMBER=int(NUMBER)
+                    }
+                    if(NUMBER==0){
+                        print i":"; continue
+                    }
+                    HASH=sprintf("%"NUMBER"s"," ");
+                    gsub(" ","#",HASH);
+                    print i,HASH
+                }
+            }' OFS=": "| sort | sed '/None:*[0-9]/d;1i\'
+        fi
+        if [ $1 = "yearly" ]; then
+            awk -F, -vWIDTH="$2" '
+            BEGIN{
+                MAX=0
+            }
+            {
+                if($0!=""){
+                    if($2==""){
+                        a["None"]++;
+                        next
+                    }
+                    split($2,c,"-");
+                    a[c[1]]++
+                }
+            }
+            END{
+                for (j in a){
+                    if(a[j]>MAX){
+                        MAX=a[j]
+                    }
+                }
+                for (i in a){
+                    if(WIDTH == -1){
+                        NUMBER=a[i]/100000;
+                        NUMBER=int(NUMBER)
+                    }
+                    else{
+                        NUMBER=WIDTH*a[i]/MAX;
+                        NUMBER=int(NUMBER)
+                    }
+                    if(NUMBER==0){
+                        print i":"; continue
+                    }
+                    HASH=sprintf("%"NUMBER"s"," ");
+                    gsub(" ","#",HASH);  
+                    print i,HASH
+                }
+            }' OFS=": "| sort | sed '/None:*[0-9]/d;1i\'
+        fi
+        if [ $1 = "districts" ]; then
+            awk -F, -vWIDTH="$2" '
+            BEGIN{
+                MAX=0
+            }
+            {
+                if($0!=""){
+                    if($6==""){
+                        a["None"]++;
+                        next
+                    }
+                    a[$6]++
+                }
+            }
+            END{
+                for (j in a){
+                    if(a[j]>MAX){
+                        MAX=a[j]
+                    }
+                }
+                for (i in a){
+                    if(WIDTH == -1){
+                        NUMBER=a[i]/1000;
+                        NUMBER=int(NUMBER)
+                    }
+                    else{
+                        NUMBER=WIDTH*a[i]/MAX;
+                        NUMBER=int(NUMBER)
+                    }
+                    if(NUMBER==0){
+                        print i":"; 
+                        continue
+                    }
+                    HASH=sprintf("%"NUMBER"s"," ");
+                    gsub(" ","#",HASH);
+                    print i,HASH
+                }
+            }' OFS=": "| sort | sed '/None:*[0-9]/d;1i\'
+        fi
+
+        if [ $1 = "regions" ]; then
+            awk -F, -vWIDTH="$2" '
+            BEGIN{
+                MAX=0
+            }
+            {
+                if($0!=""){
+                    if($5==""){
+                        a["None"]++;
+                        next
+                    }
+                    a[$5]++
+                }
+            }
+            END{
+                for (j in a){
+                    if(a[j]>MAX){
+                        MAX=a[j]
+                    }
+                }
+                for (i in a){
+                    if(WIDTH == -1){
+                        NUMBER=a[i]/10000;
+                        NUMBER=int(NUMBER)
+                    }
+                    else{
+                        NUMBER=WIDTH*a[i]/MAX;
+                        NUMBER=int(NUMBER)
+                    }
+                    if(NUMBER==0){
+                        print i":";
+                        continue
+                    }
+                    HASH=sprintf("%"NUMBER"s"," ");
+                    gsub(" ","#",HASH);
+                    print i,HASH
+                }
+            }' OFS=": "| sort | sed '/None:*[0-9]/d;1i\'
+        fi
+        if [ $1 = "countries" ]; then
+            awk -F, -vWIDTH="$2" '
+            BEGIN{
+                MAX=0
+            }
+            {
+                if($0!=""){
+                    if($8=="" || $8=="CZ"){
+                        next
+                    }
+                    a[$8]++
+                }
+            }
+            END{
+                for (j in a){
+                    if(a[j]>MAX){
+                        MAX=a[j]
+                    }
+                }
+                for (i in a){
+                    if(WIDTH == -1){
+                        NUMBER=a[i]/100;
+                        NUMBER=int(NUMBER)
+                    }
+                    else{
+                        NUMBER=WIDTH*a[i]/MAX;
+                        NUMBER=int(NUMBER)
+                    }
+                    if(NUMBER==0){
+                        print i":";
+                        continue
+                    }
+                    HASH=sprintf("%"NUMBER"s"," ");
+                    gsub(" ","#",HASH);
+                    print i,HASH
+                }
+            }' OFS=": "| sort | sed '/None:*[0-9]/d;1i\'
+        fi
+        #bruteforce of age command (again) with histograms
+        if [ $1 = "age" ]; then
+            awk -F, -vWIDTH="$2" '
+            BEGIN{
+                MAX=0;
+                a[1]="";
+                a[2]="";
+                a[3]="";
+                a[4]="";
+                a[5]="";
+                a[6]="";
+                a[7]="";
+                a[8]="";
+                a[9]="";
+                a[10]="";
+                a[11]="";
+                a[12]="";
+            }
+            {
+                if($3==""){a[13]++}
+                else if($3<=5){a[1]++}
+                else if($3>=6 && $3<=15){a[2]++} 
+                else if($3>=16 && $3<=25){a[3]++}
+                else if($3>=26 && $3<=35){a[4]++}
+                else if($3>=36 && $3<=45){a[5]++}
+                else if($3>=46 && $3<=55){a[6]++} 
+                else if($3>=56 && $3<=65){a[7]++}
+                else if($3>=66 && $3<=75){a[8]++}
+                else if($3>=76 && $3<=85){a[9]++}
+                else if($3>=86 && $3<=95){a[10]++}
+                else if($3>=96 && $3<=105){a[11]++}
+                else if($3>=105){a[12]++}
+            }
+            END{
+                for (j = 1; j <= 13; ++j){
+                    if(MAX<a[j]){
+                        MAX=a[j]
+                    }
+                }
+                for (i = 1; i <= 13; ++i){
+                    if(a[i]==""){
+                        a[i]=0
+                    }
+                    if(WIDTH == -1){
+                        NUMBER=a[i]/10000;
+                        NUMBER=int(NUMBER)
+                    }
+                    else{
+                        NUMBER=WIDTH*a[i]/MAX;
+                        NUMBER=int(NUMBER)
+                    }
+                    if(NUMBER==0){
+                        continue
+                    }
+                    HASH[i]=sprintf("%"NUMBER"s"," ");
+                    gsub(" ","#",HASH[i])
+                }
+                print "0-5   : "HASH[1];
+                print "6-15  : "HASH[2];
+                print "16-25 : "HASH[3]; 
+                print "26-35 : "HASH[4];
+                print "36-45 : "HASH[5];
+                print "46-55 : "HASH[6];
+                print "56-65 : "HASH[7]; 
+                print "66-75 : "HASH[8];
+                print "76-85 : "HASH[9];
+                print "86-95 : "HASH[10];
+                print "96-105: "HASH[11];
+                print ">105  : "HASH[12]; 
+                if(a[13]!=0 && $0!=""){
+                    print "None  : "HASH[13]
+                }
+            }'
+        fi
+    fi
+}
+#deciding if use stdin or some files were given
+if [ -z "$GZ_LOG_FILES" ] && [ -z "$BZ_LOG_FILES" ] && [ -z "$LOG_FILES" ];then
+    cat|datevalid "$HEADER"|datefilter "$DATE_BEFORE" "$DATE_AFTER" |gendervalid "$GENDER"|commandfunc "$COMMAND" "$WIDTH"
+else 
+    #saving given argument files into 1 variable with *cat to work with them because RAM issues when saving into variable
+    if [ -n "$LOG_FILES" ]; then
+        INPUT="cat$LOG_FILES"
+    fi
+    if [ -n "$GZ_LOG_FILES" ]; then
+        if [ -z "$INPUT" ]; then
+            INPUT="zcat$GZ_LOG_FILES"
+        else
+            INPUT="$INPUT ; zcat$GZ_LOG_FILES"
+        fi
+    fi
+    if [ -n "$BZ_LOG_FILES" ]; then
+        if [ -z "$INPUT" ]; then
+            INPUT="bzcat$BZ_LOG_FILES"
+        else
+            INPUT="$INPUT ; bzcat$BZ_LOG_FILES"
+        fi
+    fi
+    #evaluating string with files validating and filtrating data with funtioncs and printing output with command
+    eval "$INPUT"|datevalid "$HEADER"|datefilter "$DATE_BEFORE" "$DATE_AFTER" |gendervalid "$GENDER"|commandfunc "$COMMAND" "$WIDTH"
+fi
